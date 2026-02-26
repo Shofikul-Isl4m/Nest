@@ -1,19 +1,20 @@
 """Management command to run notification worker."""
 
-import contextlib
+import json
 import logging
 import os
 import socket
 import time
 
 from django.conf import settings
-from django.core.exceptions import ObjectDoesNotExist
+from django.contrib.contenttypes.models import ContentType
 from django.core.mail import send_mail
 from django.core.management.base import BaseCommand
 from django_redis import get_redis_connection
 
-from apps.nest.models import User
-from apps.owasp.models.notification import Notification
+from apps.owasp.models.chapter import Chapter
+from apps.owasp.models.event import Event
+from apps.owasp.models.notification import Notification, Subscription
 from apps.owasp.models.snapshot import Snapshot
 
 logger = logging.getLogger(__name__)
@@ -28,9 +29,7 @@ class Command(BaseCommand):
     MAX_RETRIES = 5
     BASE_DELAY = 2  # seconds
     DELAY_MULTIPLIER = 2
-    MAX_DLQ_RETRIES = 5
     DLQ_STREAM_KEY = "owasp_notifications_dlq"
-    DLQ_CHECK_INTERVAL = 300  # seconds
 
     def handle(self, *args, **options):
         """Handle execution."""
@@ -44,8 +43,6 @@ class Command(BaseCommand):
 
         self.recover_pending_messages(redis_conn, stream_key, group_name, consumer_name)
 
-        last_dlq_check = time.time()
-
         while True:
             try:
                 # Read new messages specifically for this group
@@ -58,6 +55,7 @@ class Command(BaseCommand):
                     block=5000,
                 )
                 # Process main stream messages
+                logger.info("event: %s", events)
                 if events:
                     for _, messages in events:
                         for message_id, data in messages:
@@ -68,11 +66,6 @@ class Command(BaseCommand):
                                 logger.info("Message processed successfully.")
                             except Exception:
                                 logger.exception("Error processing message %s", message_id)
-
-                # Check DLQ every 300 seconds
-                if time.time() - last_dlq_check > self.DLQ_CHECK_INTERVAL:
-                    self.process_dlq(redis_conn)
-                    last_dlq_check = time.time()
 
             except Exception as e:
                 if "NOGROUP" in str(e):
@@ -96,68 +89,38 @@ class Command(BaseCommand):
     def process_message(self, data):
         """Process a single message from the stream."""
         msg_type = data.get(b"type", b"").decode("utf-8")
-        if msg_type == "snapshot_published":
-            self.handle_snapshot_published(data)
 
-    def handle_snapshot_published(self, data):
-        """Handle snapshot published event."""
-        redis_conn = get_redis_connection("default")
+        handlers = {
+            "snapshot_published": self.handle_snapshot_published,
+            "chapter_created": self.handle_chapter_created,
+            "chapter_updated": self.handle_chapter_updated,
+            "event_created": self.handle_event_created,
+            "event_updated": self.handle_event_updated,
+            "event_deadline_reminder": self.handle_event_deadline_reminder,
+        }
 
-        try:
-            raw_id = data.get(b"snapshot_id")
-            if not raw_id:
-                return
-            snapshot_id = int(raw_id.decode("utf-8"))
-            snapshot = Snapshot.objects.get(id=snapshot_id)
+        handler = handlers.get(msg_type)
+        if handler:
+            handler(data)
+        else:
+            logger.warning("Unknown message type: %s", msg_type)
 
-            users = User.objects.filter(is_active=True)
-
-            if not users.exists():
-                logger.info("No active users found.")
-                return
-
-            logger.info("Sending snapshot notification to %d users", users.count())
-
-            failed_users = []
-
-            for user in users:
-                success = self.send_notification_with_retry(user, snapshot)
-                if not success:
-                    failed_users.append(
-                        {
-                            "user_id": str(user.id),
-                            "email": user.email,
-                            "snapshot_id": str(snapshot_id),
-                        }
-                    )
-
-            # Send failed users to DLQ
-            if failed_users:
-                for failed_user in failed_users:
-                    dlq_message = {
-                        "type": "failed_notification",
-                        "user_id": failed_user["user_id"],
-                        "snapshot_id": failed_user["snapshot_id"],
-                        "timestamp": str(time.time()),
-                        "dlq_retries": "0",
-                    }
-                    redis_conn.xadd(self.DLQ_STREAM_KEY, dlq_message)
-
-                logger.warning("Sent %d failed notifications to DLQ", len(failed_users))
-
-        except Snapshot.DoesNotExist:
-            logger.exception("Snapshot matching ID %s not found.", snapshot_id)
-        except Exception:
-            logger.exception("Error handling snapshot published event")
-
-    def send_notification_with_retry(self, user, snapshot):
+    def send_notification_with_retry(
+        self, *, user, title, message, notification_type, related_link
+    ):
         """Send notification with exponential backoff retry logic."""
         retry_count = 0
         last_error = None
 
         while retry_count <= self.MAX_RETRIES:
             try:
-                self.send_notification(user, snapshot)
+                self.send_notification(
+                    user=user,
+                    title=title,
+                    message=message,
+                    notification_type=notification_type,
+                    related_link=related_link,
+                )
             except Exception as e:
                 retry_count += 1
                 last_error = e
@@ -190,22 +153,17 @@ class Command(BaseCommand):
 
         return False
 
-    def send_notification(self, user, snapshot):
+    def send_notification(self, *, user, title, message, notification_type, related_link):
         """Send notification to user."""
-        title = f"New Snapshot Published: {snapshot.title}"
-        related_link = f"{settings.SITE_URL}/community/snapshots/{snapshot.key}"
-
         if Notification.objects.filter(
             recipient_id=user.id,
-            type="snapshot_published",
+            type=notification_type,
             related_link=related_link,
+            message=message,
         ).exists():
-            logger.info("Already notified %s for this snapshot, skipping", user.email)
+            logger.info("Already notified %s for %s, skipping", user.email, notification_type)
             return
 
-        message = f"Check out the latest OWASP snapshot: {snapshot.title}"
-
-        # Send Email
         send_mail(
             subject=title,
             message=message,
@@ -213,112 +171,227 @@ class Command(BaseCommand):
             recipient_list=[user.email],
             fail_silently=False,
         )
-        logger.info("Sent email to %s", user.email)
+        logger.info("Sent %s email to %s", notification_type, user.email)
 
-        # Create DB record
         Notification.objects.create(
             recipient=user,
-            type="snapshot_published",
+            type=notification_type,
             title=title,
             message=message,
             related_link=related_link,
         )
 
-    def process_dlq(self, redis_conn):
-        """Process messages from DLQ - retry failed notifications."""
-        lock = redis_conn.lock("owasp_notifications_dlq_lock", timeout=600, blocking=False)
-        if not lock.acquire():
-            return
+    def handle_snapshot_published(self, data):
+        """Handle snapshot published event."""
+        self._handle_entity_notification(
+            data=data,
+            id_field=b"snapshot_id",
+            model_class=Snapshot,
+            notification_type="snapshot_published",
+            global_subscription=True,
+        )
+
+    def handle_chapter_created(self, data):
+        """Handle chapter created event — notify 'all chapters' subscribers."""
+        self._handle_entity_notification(
+            data=data,
+            id_field=b"chapter_id",
+            model_class=Chapter,
+            notification_type="chapter_created",
+            global_subscription=True,
+        )
+
+    def handle_chapter_updated(self, data):
+        """Handle chapter updated event — notify specific chapter subscribers."""
+        self._handle_entity_notification(
+            data=data,
+            id_field=b"chapter_id",
+            model_class=Chapter,
+            notification_type="chapter_updated",
+            global_subscription=False,
+        )
+
+    def handle_event_created(self, data):
+        """Handle event created — notify 'all events' subscribers."""
+        self._handle_entity_notification(
+            data=data,
+            id_field=b"event_id",
+            model_class=Event,
+            notification_type="event_created",
+            global_subscription=True,
+        )
+
+    def handle_event_updated(self, data):
+        """Handle event updated — notify specific event subscribers."""
+        self._handle_entity_notification(
+            data=data,
+            id_field=b"event_id",
+            model_class=Event,
+            notification_type="event_updated",
+            global_subscription=False,
+        )
+
+    def handle_event_deadline_reminder(self, data):
+        """Handle event deadline reminder — notify specific event subscribers."""
+        self._handle_entity_notification(
+            data=data,
+            id_field=b"event_id",
+            model_class=Event,
+            notification_type="event_deadline_reminder",
+            global_subscription=False,
+        )
+
+    def _handle_entity_notification(
+        self, *, data, id_field, model_class, notification_type, global_subscription=False
+    ):
+        """Handle entity notification for chapters, events, and snapshots.
+
+        Args:
+            data: Redis stream message data.
+            id_field: The byte field name for the entity ID.
+            model_class: The Django model class.
+            notification_type: The notification type string.
+            global_subscription: If True, query subscribers with object_id=0 (all entities).
+                If False, query subscribers with object_id=entity.id (specific entity).
+
+        """
+        redis_conn = get_redis_connection("default")
 
         try:
-            self.stdout.write("Checking DLQ for failed notifications...")
-            messages = redis_conn.xrange(self.DLQ_STREAM_KEY, "-", "+", count=50)
+            raw_id = data.get(id_field)
+            if not raw_id:
+                return
+            entity_id = int(raw_id.decode("utf-8"))
+            entity = model_class.objects.get(id=entity_id)
 
-            if not messages:
-                self.stdout.write("No messages in DLQ")
+            content_type = ContentType.objects.get_for_model(model_class)
+            subscription_filter = {
+                "content_type": content_type,
+                "object_id": 0 if global_subscription else entity_id,
+            }
+            subscriptions = Subscription.objects.filter(**subscription_filter).select_related(
+                "user"
+            )
+            users = [sub.user for sub in subscriptions if sub.user.is_active]
+
+            if not users:
+                logger.info("No recipients found for %s.", notification_type)
                 return
 
-            processed_count = 0
-            failed_count = 0
+            logger.info("Sending %s notification to %d users", notification_type, len(users))
 
-            for msg_id, data in messages:
-                try:
-                    dlq_retries = 0
-                    msg_type = (data.get(b"type") or b"").decode("utf-8")
-                    if msg_type == "recovery_failed":
-                        logger.error(
-                            "Permanent recovery failure for message %s: %s",
-                            (data.get(b"message_id") or b"unknown").decode("utf-8"),
-                            (data.get(b"error") or b"unknown").decode("utf-8"),
-                        )
-                        redis_conn.xdel(self.DLQ_STREAM_KEY, msg_id)
-                        continue
+            entity_name = str(entity)
+            entity_type = model_class.__name__.lower()
 
-                    raw_dlq_retries = data.get(b"dlq_retries", b"0")
-                    try:
-                        dlq_retries = int(raw_dlq_retries.decode("utf-8"))
-                    except (ValueError, AttributeError):
-                        dlq_retries = 0
-                    raw_user_id = data.get(b"user_id")
-                    raw_snapshot_id = data.get(b"snapshot_id")
+            days_bytes = data.get(b"days_remaining")
+            days_info = ""
+            if days_bytes:
+                days = days_bytes.decode()
+                days_info = f" ({days} days left)"
 
-                    if not raw_user_id or not raw_snapshot_id:
-                        logger.warning("DLQ message %s missing required fields, removing", msg_id)
-                        redis_conn.xdel(self.DLQ_STREAM_KEY, msg_id)
-                        continue
+            changed_fields_bytes = data.get(b"changed_fields")
+            changes_description = ""
+            if changed_fields_bytes:
+                changed_fields = json.loads(changed_fields_bytes.decode())
+                changes_list = []
+                for field, values in changed_fields.items():
+                    old_val = values.get("old") or "empty"
+                    new_val = values.get("new") or "empty"
+                    field_display = field.replace("_", " ").title()
+                    changes_list.append(f"{field_display}: {old_val} → {new_val}")
+                changes_description = " | ".join(changes_list)
 
-                    user_id = int(raw_user_id.decode("utf-8"))
-                    snapshot_id = int(raw_snapshot_id.decode("utf-8"))
+            entity_title = entity.title if hasattr(entity, "title") else entity_name
 
-                    user = User.objects.get(id=user_id)
-                    snapshot = Snapshot.objects.get(id=snapshot_id)
+            titles = {
+                "snapshot_published": f"New Snapshot Published: {entity_title}",
+                "chapter_created": f"New Chapter Created: {entity_name}",
+                "chapter_updated": f"Chapter Updated: {entity_name}",
+                "event_created": f"New Event Published: {entity_name}",
+                "event_updated": f"Event Updated: {entity_name}",
+                "event_deadline_reminder": f"Event Deadline Approaching{days_info}: {entity_name}",
+            }
+            entity_messages = {
+                "snapshot_published": f"Check out the latest OWASP snapshot: {entity_title}",
+                "chapter_created": f"A new OWASP chapter has been created: {entity_name}",
+                "chapter_updated": (
+                    f"The OWASP chapter '{entity_name}' has been updated. "
+                    f"Changes: {changes_description}"
+                    if changes_description
+                    else f"The OWASP chapter '{entity_name}' has been updated."
+                ),
+                "event_created": f"A new OWASP event has been published: {entity_name}",
+                "event_updated": (
+                    f"The OWASP event '{entity_name}' has been updated. "
+                    f"Changes: {changes_description}"
+                    if changes_description
+                    else f"The OWASP event '{entity_name}' has been updated."
+                ),
+                "event_deadline_reminder": (
+                    f"Reminder: The OWASP event '{entity_name}' "
+                    f"deadline is approaching{days_info}."
+                ),
+            }
+            url_builders = {
+                "snapshot": lambda e: f"community/snapshots/{e.key}",
+                "chapter": lambda e: f"chapters/{e.id}",
+                "event": lambda e: f"events/{e.id}",
+            }
 
-                    self.send_notification(user, snapshot)
-                    redis_conn.xdel(self.DLQ_STREAM_KEY, msg_id)
-                    processed_count += 1
-                    logger.info(
-                        "Successfully reprocessed notification for user %s",
-                        user.email,
+            title = titles.get(notification_type, f"Notification: {entity_name}")
+            message = entity_messages.get(notification_type, f"Update for {entity_name}")
+
+            url_builder = url_builders.get(entity_type)
+            if url_builder:
+                related_link = f"{settings.SITE_URL}/{url_builder(entity)}"
+            else:
+                related_link = f"{settings.SITE_URL}"
+
+            failed_users = []
+
+            for user in users:
+                success = self.send_notification_with_retry(
+                    user=user,
+                    title=title,
+                    message=message,
+                    notification_type=notification_type,
+                    related_link=related_link,
+                )
+                if not success:
+                    failed_users.append(
+                        {
+                            "user": user,
+                            "user_id": str(user.id),
+                            "entity_type": entity_type,
+                            "entity_id": str(entity_id),
+                        }
                     )
 
-                except ObjectDoesNotExist:
-                    logger.warning("User or snapshot not found, removing from DLQ")
-                    redis_conn.xdel(self.DLQ_STREAM_KEY, msg_id)
-                    failed_count += 1
-                except Exception:
-                    failed_count += 1
-                    dlq_retries += 1
+            if failed_users:
+                for failed_user in failed_users:
+                    user_obj = failed_user.get("user")
+                    dlq_message = {
+                        "type": "failed_notification",
+                        "notification_type": notification_type,
+                        "user_id": failed_user["user_id"],
+                        "user_email": user_obj.email if user_obj else "unknown",
+                        "entity_type": entity_type,
+                        "entity_id": str(entity_id),
+                        "entity_name": entity_name,
+                        "title": title,
+                        "message": message,
+                        "related_link": related_link,
+                        "timestamp": str(time.time()),
+                        "dlq_retries": "0",
+                    }
+                    redis_conn.xadd(self.DLQ_STREAM_KEY, dlq_message)
 
-                    if dlq_retries > self.MAX_DLQ_RETRIES:
-                        redis_conn.xdel(self.DLQ_STREAM_KEY, msg_id)
-                        logger.exception(
-                            "DLQ message %s exceeded max retries (%d). Dropping.",
-                            msg_id,
-                            self.MAX_DLQ_RETRIES,
-                        )
-                    else:
-                        new_data = {k.decode("utf-8"): v.decode("utf-8") for k, v in data.items()}
-                        new_data["dlq_retries"] = str(dlq_retries)
-                        redis_conn.xadd(self.DLQ_STREAM_KEY, new_data)
-                        redis_conn.xdel(self.DLQ_STREAM_KEY, msg_id)
-                        logger.warning(
-                            "Failed to reprocess DLQ message %s (attempt %d/%d). Re-queued.",
-                            msg_id,
-                            dlq_retries,
-                            self.MAX_DLQ_RETRIES,
-                        )
+                logger.warning("Sent %d failed notifications to DLQ", len(failed_users))
 
-            logger.info(
-                "DLQ processing complete: %d successful, %d failed",
-                processed_count,
-                failed_count,
-            )
-
+        except model_class.DoesNotExist:
+            logger.exception("%s matching ID not found.", model_class.__name__)
         except Exception:
-            logger.exception("Error processing DLQ")
-        finally:
-            with contextlib.suppress(Exception):
-                lock.release()
+            logger.exception("Error handling %s event", notification_type)
 
     def recover_pending_messages(self, redis_conn, stream_key, group_name, consumer_name):
         """Recover and reprocess stuck messages from PEL."""

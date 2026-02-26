@@ -1,7 +1,6 @@
 from unittest import mock
 
 import pytest
-from django.core.exceptions import ObjectDoesNotExist
 
 from apps.nest.models import User
 from apps.owasp.management.commands.owasp_run_notification_worker import Command
@@ -38,7 +37,13 @@ class TestOwaspRunNotificationWorker:
         mock_settings.SITE_URL = "https://example.com"
         mock_notification.objects.filter.return_value.exists.return_value = False
 
-        command.send_notification(mock_user, mock_snapshot)
+        command.send_notification(
+            user=mock_user,
+            title=f"New Snapshot Published: {mock_snapshot.title}",
+            message=f"Check out the latest OWASP snapshot: {mock_snapshot.title}",
+            notification_type="snapshot_published",
+            related_link=f"https://example.com/community/snapshots/{mock_snapshot.key}",
+        )
 
         mock_send_mail.assert_called_once()
         mock_notification.objects.create.assert_called_once_with(
@@ -57,85 +62,16 @@ class TestOwaspRunNotificationWorker:
         """Test that notification is skipped if it already exists."""
         mock_notification.objects.filter.return_value.exists.return_value = True
 
-        command.send_notification(mock_user, mock_snapshot)
+        command.send_notification(
+            user=mock_user,
+            title=f"New Snapshot Published: {mock_snapshot.title}",
+            message=f"Check out the latest OWASP snapshot: {mock_snapshot.title}",
+            notification_type="snapshot_published",
+            related_link=f"https://example.com/community/snapshots/{mock_snapshot.key}",
+        )
 
         mock_send_mail.assert_not_called()
         mock_notification.objects.create.assert_not_called()
-
-    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.User")
-    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Snapshot")
-    @mock.patch(
-        "apps.owasp.management.commands.owasp_run_notification_worker.Command.send_notification"
-    )
-    def test_process_dlq_success(
-        self,
-        mock_send_notify,
-        mock_snapshot_model,
-        mock_user_model,
-        command,
-        mock_user,
-        mock_snapshot,
-    ):
-        """Test successful DLQ processing."""
-        redis_conn = mock.Mock()
-        redis_conn.lock.return_value.acquire.return_value = True
-
-        # Mock message data
-        redis_conn.xrange.return_value = [(b"123-0", {b"user_id": b"123", b"snapshot_id": b"456"})]
-
-        mock_user_model.objects.get.return_value = mock_user
-        mock_snapshot_model.objects.get.return_value = mock_snapshot
-
-        command.process_dlq(redis_conn)
-
-        mock_send_notify.assert_called_once_with(mock_user, mock_snapshot)
-        redis_conn.xdel.assert_called_with(command.DLQ_STREAM_KEY, b"123-0")
-
-    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.User")
-    def test_process_dlq_missing_object(self, mock_user, command):
-        """Test DLQ processing handles ObjectDoesNotExist by removing message."""
-        redis_conn = mock.Mock()
-        redis_conn.lock.return_value.acquire.return_value = True
-
-        redis_conn.xrange.return_value = [(b"123-0", {b"user_id": b"999", b"snapshot_id": b"456"})]
-
-        mock_user.objects.get.side_effect = ObjectDoesNotExist
-
-        command.process_dlq(redis_conn)
-
-        redis_conn.xdel.assert_called_with(command.DLQ_STREAM_KEY, b"123-0")
-
-    def test_process_dlq_missing_fields(self, command):
-        """Test DLQ processing handles messages with missing fields."""
-        redis_conn = mock.Mock()
-        redis_conn.lock.return_value.acquire.return_value = True
-
-        # Missing user_id
-        redis_conn.xrange.return_value = [(b"123-0", {b"snapshot_id": b"456"})]
-
-        command.process_dlq(redis_conn)
-
-        redis_conn.xdel.assert_called_with(command.DLQ_STREAM_KEY, b"123-0")
-
-    def test_process_dlq_recovery_failure(self, command):
-        """Test DLQ processing handles recovery_failed messages by removing them."""
-        redis_conn = mock.Mock()
-        redis_conn.lock.return_value.acquire.return_value = True
-
-        redis_conn.xrange.return_value = [
-            (
-                b"123-0",
-                {
-                    b"type": b"recovery_failed",
-                    b"message_id": b"original-999",
-                    b"error": b"Something went wrong",
-                },
-            )
-        ]
-
-        command.process_dlq(redis_conn)
-
-        redis_conn.xdel.assert_called_with(command.DLQ_STREAM_KEY, b"123-0")
 
     @mock.patch.object(Command, "process_message")
     def test_recover_pending_messages(self, mock_process, command):
@@ -162,40 +98,228 @@ class TestOwaspRunNotificationWorker:
         assert redis_conn.xadd.call_args[0][0] == command.DLQ_STREAM_KEY
         redis_conn.xack.assert_called_once()
 
-    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.User")
-    def test_process_dlq_retry_increment(self, mock_user, command):
-        """Test that DLQ processing increments retry count and re-adds on failure."""
-        redis_conn = mock.Mock()
-        redis_conn.lock.return_value.acquire.return_value = True
 
-        redis_conn.xrange.return_value = [
-            (b"123-0", {b"user_id": b"123", b"snapshot_id": b"456", b"dlq_retries": b"1"})
-        ]
+class TestProcessMessageRouting:
+    """Test process_message routes new entity message types correctly."""
 
-        mock_user.objects.get.side_effect = Exception("Temp Error")
+    @pytest.fixture
+    def command(self):
+        return Command()
 
-        command.process_dlq(redis_conn)
+    @pytest.mark.parametrize(
+        ("msg_type", "handler_name"),
+        [
+            ("snapshot_published", "handle_snapshot_published"),
+            ("chapter_created", "handle_chapter_created"),
+            ("chapter_updated", "handle_chapter_updated"),
+            ("event_created", "handle_event_created"),
+            ("event_updated", "handle_event_updated"),
+            ("event_deadline_reminder", "handle_event_deadline_reminder"),
+        ],
+    )
+    def test_routes_to_correct_handler(self, command, msg_type, handler_name):
+        """Test that each message type routes to the correct handler."""
+        data = {b"type": msg_type.encode()}
+        with mock.patch.object(command, handler_name) as mock_handler:
+            command.process_message(data)
+            mock_handler.assert_called_once_with(data)
 
-        # Should be deleted and re-added with count 2
-        redis_conn.xdel.assert_called_with(command.DLQ_STREAM_KEY, b"123-0")
-        assert redis_conn.xadd.called
-        new_msg = redis_conn.xadd.call_args[0][1]
-        assert new_msg["dlq_retries"] == "2"
+    def test_unknown_message_type_does_not_raise(self, command):
+        """Test that unknown message types are handled gracefully."""
+        data = {b"type": b"unknown_type"}
+        command.process_message(data)  # Should not raise
 
-    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.User")
-    def test_process_dlq_max_retries_exceeded(self, mock_user, command):
-        """Test that DLQ processing drops message after max retries."""
-        redis_conn = mock.Mock()
-        redis_conn.lock.return_value.acquire.return_value = True
 
-        # Already at max retries (5)
-        redis_conn.xrange.return_value = [
-            (b"123-0", {b"user_id": b"123", b"snapshot_id": b"456", b"dlq_retries": b"5"})
-        ]
+class TestEntityNotificationHandlers:
+    """Test entity notification handler methods."""
 
-        mock_user.objects.get.side_effect = Exception("Final Error")
+    @pytest.fixture
+    def command(self):
+        return Command()
 
-        command.process_dlq(redis_conn)
+    @mock.patch(
+        "apps.owasp.management.commands.owasp_run_notification_worker.get_redis_connection"
+    )
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Subscription")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.ContentType")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Snapshot")
+    def test_snapshot_published_queries_global_subscribers(
+        self, mock_snapshot_cls, mock_ct, mock_sub, mock_redis
+    ):
+        """Test that snapshot_published queries global subscribers (object_id=0)."""
+        command = Command()
+        mock_redis.return_value = mock.MagicMock()
+        mock_snapshot = mock.MagicMock()
+        mock_snapshot.title = "Test Snapshot"
+        mock_snapshot.key = "test-key"
+        mock_snapshot_cls.objects.get.return_value = mock_snapshot
+        mock_snapshot_cls.DoesNotExist = Exception
+        mock_snapshot_cls.__name__ = "Snapshot"
 
-        redis_conn.xdel.assert_called_with(command.DLQ_STREAM_KEY, b"123-0")
-        assert redis_conn.xadd.call_count == 0
+        mock_content_type = mock.MagicMock()
+        mock_ct.objects.get_for_model.return_value = mock_content_type
+
+        # Mock subscriptions
+        mock_sub.objects.filter.return_value.select_related.return_value = []
+
+        data = {b"snapshot_id": b"99"}
+
+        command.handle_snapshot_published(data)
+
+        # Verify subscriptions queried with object_id=0
+        mock_sub.objects.filter.assert_called_once_with(
+            content_type=mock_content_type, object_id=0
+        )
+
+    @mock.patch(
+        "apps.owasp.management.commands.owasp_run_notification_worker.get_redis_connection"
+    )
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Subscription")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.ContentType")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Chapter")
+    def test_chapter_created_queries_global_subscribers(
+        self, mock_chapter_cls, mock_ct, mock_sub, mock_redis, command
+    ):
+        """Test that chapter_created queries subscribers with object_id=0."""
+        mock_redis.return_value = mock.MagicMock()
+        mock_chapter = mock.MagicMock()
+        mock_chapter_cls.objects.get.return_value = mock_chapter
+        mock_chapter_cls.DoesNotExist = Exception
+        mock_chapter_cls.__name__ = "Chapter"
+
+        mock_content_type = mock.MagicMock()
+        mock_ct.objects.get_for_model.return_value = mock_content_type
+        mock_sub.objects.filter.return_value.select_related.return_value = []
+
+        data = {b"chapter_id": b"1"}
+        command.handle_chapter_created(data)
+
+        mock_sub.objects.filter.assert_called_once_with(
+            content_type=mock_content_type, object_id=0
+        )
+
+    @mock.patch(
+        "apps.owasp.management.commands.owasp_run_notification_worker.get_redis_connection"
+    )
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Subscription")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.ContentType")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Chapter")
+    def test_chapter_updated_queries_specific_subscribers(
+        self, mock_chapter_cls, mock_ct, mock_sub, mock_redis, command
+    ):
+        """Test that chapter_updated queries subscribers with specific object_id."""
+        mock_redis.return_value = mock.MagicMock()
+        mock_chapter = mock.MagicMock()
+        mock_chapter_cls.objects.get.return_value = mock_chapter
+        mock_chapter_cls.DoesNotExist = Exception
+        mock_chapter_cls.__name__ = "Chapter"
+
+        mock_content_type = mock.MagicMock()
+        mock_ct.objects.get_for_model.return_value = mock_content_type
+        mock_sub.objects.filter.return_value.select_related.return_value = []
+
+        data = {b"chapter_id": b"42"}
+        command.handle_chapter_updated(data)
+
+        mock_sub.objects.filter.assert_called_once_with(
+            content_type=mock_content_type, object_id=42
+        )
+
+    @mock.patch(
+        "apps.owasp.management.commands.owasp_run_notification_worker.get_redis_connection"
+    )
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Subscription")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.ContentType")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Event")
+    def test_event_created_queries_global_subscribers(
+        self, mock_event_cls, mock_ct, mock_sub, mock_redis, command
+    ):
+        """Test that event_created queries subscribers with object_id=0."""
+        mock_redis.return_value = mock.MagicMock()
+        mock_event = mock.MagicMock()
+        mock_event_cls.objects.get.return_value = mock_event
+        mock_event_cls.DoesNotExist = Exception
+        mock_event_cls.__name__ = "Event"
+
+        mock_content_type = mock.MagicMock()
+        mock_ct.objects.get_for_model.return_value = mock_content_type
+        mock_sub.objects.filter.return_value.select_related.return_value = []
+
+        data = {b"event_id": b"10"}
+        command.handle_event_created(data)
+
+        mock_sub.objects.filter.assert_called_once_with(
+            content_type=mock_content_type, object_id=0
+        )
+
+    @mock.patch(
+        "apps.owasp.management.commands.owasp_run_notification_worker.get_redis_connection"
+    )
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Subscription")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.ContentType")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Event")
+    def test_event_deadline_reminder_queries_specific_subscribers(
+        self, mock_event_cls, mock_ct, mock_sub, mock_redis, command
+    ):
+        """Test that event_deadline_reminder queries subscribers with specific object_id."""
+        mock_redis.return_value = mock.MagicMock()
+        mock_event = mock.MagicMock()
+        mock_event_cls.objects.get.return_value = mock_event
+        mock_event_cls.DoesNotExist = Exception
+        mock_event_cls.__name__ = "Event"
+
+        mock_content_type = mock.MagicMock()
+        mock_ct.objects.get_for_model.return_value = mock_content_type
+        mock_sub.objects.filter.return_value.select_related.return_value = []
+
+        data = {b"event_id": b"10"}
+        command.handle_event_deadline_reminder(data)
+
+        mock_sub.objects.filter.assert_called_once_with(
+            content_type=mock_content_type, object_id=10
+        )
+
+    @mock.patch(
+        "apps.owasp.management.commands.owasp_run_notification_worker.get_redis_connection"
+    )
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Subscription")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.ContentType")
+    @mock.patch("apps.owasp.management.commands.owasp_run_notification_worker.Event")
+    def test_event_deadline_reminder_includes_days_remaining(
+        self, mock_event_cls, mock_ct, mock_sub, mock_redis, command
+    ):
+        """Test that event_deadline_reminder includes days remaining in title/message."""
+        mock_redis.return_value = mock.MagicMock()
+        mock_event = mock.MagicMock()
+        mock_event.name = "Test Event"
+        mock_event_cls.objects.get.return_value = mock_event
+        mock_event_cls.DoesNotExist = Exception
+        mock_event_cls.__name__ = "Event"
+
+        mock_content_type = mock.MagicMock()
+        mock_ct.objects.get_for_model.return_value = mock_content_type
+
+        # Mock a subscriber
+        mock_user = mock.MagicMock(is_active=True)
+        mock_sub_obj = mock.MagicMock()
+        mock_sub_obj.user = mock_user
+        mock_sub.objects.filter.return_value.select_related.return_value = [mock_sub_obj]
+
+        data = {b"event_id": b"10", b"days_remaining": b"3"}
+
+        with mock.patch.object(command, "send_notification_with_retry") as mock_send:
+            command.handle_event_deadline_reminder(data)
+
+            mock_send.assert_called_once()
+            kwargs = mock_send.call_args[1]
+            assert "(3 days left)" in kwargs["title"]
+            assert "(3 days left)" in kwargs["message"]
+
+    @mock.patch(
+        "apps.owasp.management.commands.owasp_run_notification_worker.get_redis_connection"
+    )
+    def test_missing_entity_id_returns_early(self, mock_redis, command):
+        """Test that messages without entity ID are handled gracefully."""
+        mock_redis.return_value = mock.MagicMock()
+        data = {b"type": b"chapter_created"}
+        command.handle_chapter_created(data)  # Should not raise
