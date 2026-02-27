@@ -164,9 +164,10 @@ class Command(BaseCommand):
             logger.info("Already notified %s for %s, skipping", user.email, notification_type)
             return
 
+        full_message = f"{message}\n\nView: {related_link}" if related_link else message
         send_mail(
             subject=title,
-            message=message,
+            message=full_message,
             from_email="noreply@owasp.org",
             recipient_list=[user.email],
             fail_silently=False,

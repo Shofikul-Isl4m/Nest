@@ -29,12 +29,8 @@ class Command(BaseCommand):
             events = Event.objects.filter(start_date=target_date)
 
             for event in events:
-                self.stdout.write(
-                    f"  Event '{event.name}' starts in {days} days ({target_date})"
-                )
+                self.stdout.write(f"  Event '{event.name}' starts in {days} days ({target_date})")
                 publish_event_notification(event, "deadline_reminder", days_remaining=days)
                 total_reminders += 1
 
-        self.stdout.write(
-            self.style.SUCCESS(f"Queued {total_reminders} deadline reminder(s).")
-        )
+        self.stdout.write(self.style.SUCCESS(f"Queued {total_reminders} deadline reminder(s)."))

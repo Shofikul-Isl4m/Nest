@@ -15,9 +15,9 @@ def chapter_pre_save(sender, instance, **kwargs):  # noqa: ARG001
     if instance.pk:
         db_instance = Chapter.objects.filter(pk=instance.pk).values(*MEANINGFUL_FIELDS).first()
         if db_instance:
-            instance._previous_values = {
+            instance._previous_values = {  # noqa: SLF001
                 field: db_instance.get(field) for field in MEANINGFUL_FIELDS
-            }  # noqa: SLF001
+            }
     else:
         instance._previous_values = {}  # noqa: SLF001
 

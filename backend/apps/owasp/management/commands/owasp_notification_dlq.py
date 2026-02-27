@@ -1,9 +1,7 @@
 """Management command to manage notification DLQ."""
 
 import sys
-import time
 
-from django.conf import settings
 from django.core.mail import send_mail
 from django.core.management.base import BaseCommand
 from django_redis import get_redis_connection
@@ -76,7 +74,8 @@ class Command(BaseCommand):
             retries = self._get_value(data, b"dlq_retries", "0")
 
             self.stdout.write(
-                f"{msg_id_str:<20} | {user_email:<25} | {notif_type:<18} | {entity_name:<15} | {retries:<8}"
+                f"{msg_id_str:<20} | {user_email:<25} | "
+                f"{notif_type:<18} | {entity_name:<15} | {retries:<8}"
             )
 
         self.stdout.write("=" * 100)
@@ -87,18 +86,10 @@ class Command(BaseCommand):
         if all_messages:
             messages = redis_conn.xrange(self.DLQ_STREAM_KEY, "-", "+")
         else:
-            messages = (
-                [
-                    (
-                        message_id.encode(),
-                        redis_conn.xrange(self.DLQ_STREAM_KEY, message_id, message_id),
-                    )
-                ]
-                if redis_conn.xrange(self.DLQ_STREAM_KEY, message_id, message_id)
-                else []
-            )
+            result = redis_conn.xrange(self.DLQ_STREAM_KEY, message_id, message_id)
+            messages = result or []
 
-        if not messages or (not all_messages and not messages[0][1]):
+        if not messages:
             self.stdout.write(self.style.ERROR("Message(s) not found"))
             return
 
@@ -113,13 +104,15 @@ class Command(BaseCommand):
                 user_email = self._get_value(data, b"user_email")
                 title = self._get_value(data, b"title")
                 message = self._get_value(data, b"message")
-                notif_type = self._get_value(data, b"notification_type")
                 related_link = self._get_value(data, b"related_link")
 
                 if user_email and title and message:
+                    full_message = (
+                        f"{message}\n\nView: {related_link}" if related_link else message
+                    )
                     send_mail(
                         subject=title,
-                        message=message,
+                        message=full_message,
                         from_email="noreply@owasp.org",
                         recipient_list=[user_email],
                         fail_silently=False,
@@ -131,7 +124,7 @@ class Command(BaseCommand):
                     self.stdout.write(self.style.WARNING(f"Skipped (missing data): {msg_id}"))
                     error_count += 1
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 error_count += 1
                 retries = int(self._get_value(data, b"dlq_retries", "0"))
                 new_retries = str(retries + 1)
@@ -154,7 +147,7 @@ class Command(BaseCommand):
         if all_messages:
             messages = redis_conn.xrange(self.DLQ_STREAM_KEY, "-", "+")
         else:
-            messages = [(message_id.encode(), None)]
+            messages = redis_conn.xrange(self.DLQ_STREAM_KEY, message_id, message_id)
 
         if not messages:
             self.stdout.write(self.style.ERROR("No messages found"))
@@ -169,7 +162,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(f"\nRemoved {count} message(s) from DLQ"))
 
     def _get_value(self, data, key, default=None):
-        """Helper to get value from message data."""
+        """Get value from message data."""
         value = data.get(key.encode() if isinstance(key, str) else key)
         if value:
             return value.decode("utf-8")
