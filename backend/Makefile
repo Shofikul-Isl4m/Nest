@@ -157,7 +157,7 @@ run-backend-fuzz:
 	docker compose --project-name nest-fuzz -f docker-compose/fuzz/compose.yaml up --build --remove-orphans --abort-on-container-exit backend db cache
 
 run-notification-worker:
-	@CMD="python manage.py owasp_run_notification_worker" $(MAKE) exec-backend-command
+	@CMD="python manage.py owasp_run_notification_worker" $(MAKE) exec-backend-command-it
 
 save-backup:
 	@echo "Saving Nest backup"

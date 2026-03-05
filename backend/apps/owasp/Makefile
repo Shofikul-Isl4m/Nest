@@ -11,6 +11,10 @@ owasp-aggregate-member-contributions:
 	@echo "Aggregating OWASP community member contributions"
 	@CMD="python manage.py owasp_aggregate_member_contributions" $(MAKE) exec-backend-command
 
+owasp-check-event-deadlines:
+	@echo "Checking OWASP event deadlines"
+	@CMD="python manage.py owasp_check_event_deadlines" $(MAKE) exec-backend-command
+
 owasp-create-project-metadata-file:
 	@echo "Generating metadata"
 	@CMD="python manage.py owasp_create_project_metadata_file $(entity_key)" $(MAKE) exec-backend-command
